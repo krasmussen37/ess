@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "ess": {
+      "command": "ess",
+      "args": ["mcp"]
+    }
+  }
+}
