@@ -145,6 +145,8 @@ async fn main() -> Result<()> {
 }
 
 mod commands {
+    use std::path::Path;
+
     use anyhow::{anyhow, Context, Result};
     use chrono::NaiveDate;
     use serde::Serialize;
@@ -177,12 +179,9 @@ mod commands {
 
     async fn handle_search(args: super::SearchArgs, scope: Scope, json: bool) -> Result<()> {
         let db_path = Database::default_db_path().context("resolve default ESS database path")?;
-        let index_path =
-            EmailIndex::default_index_path().context("resolve default ESS index path")?;
         let db = Database::open(&db_path)
             .with_context(|| format!("open ESS database at {}", db_path.display()))?;
-        let index = EmailIndex::open(&index_path)
-            .with_context(|| format!("open ESS index at {}", index_path.display()))?;
+        let index = open_index_with_recovery(&db)?;
 
         let filters = EmailFilters {
             scope: map_scope(scope),
@@ -265,12 +264,9 @@ mod commands {
 
     async fn handle_sync(args: super::SyncArgs) -> Result<()> {
         let db_path = Database::default_db_path().context("resolve default ESS database path")?;
-        let index_path =
-            EmailIndex::default_index_path().context("resolve default ESS index path")?;
         let db = Database::open(&db_path)
             .with_context(|| format!("open ESS database at {}", db_path.display()))?;
-        let mut index = EmailIndex::open(&index_path)
-            .with_context(|| format!("open ESS index at {}", index_path.display()))?;
+        let mut index = open_index_with_recovery(&db)?;
         let connector = GraphApiConnector::new();
         let accounts = resolve_accounts(&db, args.account.as_deref())?;
 
@@ -290,12 +286,9 @@ mod commands {
 
     async fn handle_import(args: super::ImportArgs, json: bool) -> Result<()> {
         let db_path = Database::default_db_path().context("resolve default ESS database path")?;
-        let index_path =
-            EmailIndex::default_index_path().context("resolve default ESS index path")?;
         let db = Database::open(&db_path)
             .with_context(|| format!("open ESS database at {}", db_path.display()))?;
-        let mut index = EmailIndex::open(&index_path)
-            .with_context(|| format!("open ESS index at {}", index_path.display()))?;
+        let mut index = open_index_with_recovery(&db)?;
         let account = resolve_single_account(&db, args.account.as_deref())?;
 
         let connector = JsonArchiveConnector::new();
@@ -405,12 +398,9 @@ mod commands {
 
     async fn handle_stats(json: bool) -> Result<()> {
         let db_path = Database::default_db_path().context("resolve default ESS database path")?;
-        let index_path =
-            EmailIndex::default_index_path().context("resolve default ESS index path")?;
         let db = Database::open(&db_path)
             .with_context(|| format!("open ESS database at {}", db_path.display()))?;
-        let index = EmailIndex::open(&index_path)
-            .with_context(|| format!("open ESS index at {}", index_path.display()))?;
+        let index = open_index_with_recovery(&db)?;
         let db_stats = db.get_stats()?;
         let index_stats = index.get_stats()?;
 
@@ -438,12 +428,9 @@ mod commands {
 
     async fn handle_reindex() -> Result<()> {
         let db_path = Database::default_db_path().context("resolve default ESS database path")?;
-        let index_path =
-            EmailIndex::default_index_path().context("resolve default ESS index path")?;
         let db = Database::open(&db_path)
             .with_context(|| format!("open ESS database at {}", db_path.display()))?;
-        let mut index = EmailIndex::open(&index_path)
-            .with_context(|| format!("open ESS index at {}", index_path.display()))?;
+        let mut index = open_index_with_recovery(&db)?;
         let indexed = index.reindex(&db)?;
         println!("Reindex complete: {indexed} emails indexed.");
         Ok(())
@@ -475,6 +462,48 @@ mod commands {
                 .with_context(|| format!("invalid --{label} date '{value}', expected YYYY-MM-DD"))
         })
         .transpose()
+    }
+
+    fn open_index_with_recovery(db: &Database) -> Result<EmailIndex> {
+        let index_path =
+            EmailIndex::default_index_path().context("resolve default ESS index path")?;
+        match EmailIndex::open(&index_path) {
+            Ok(index) => Ok(index),
+            Err(open_error) => {
+                tracing::warn!(
+                    "failed to open ESS index at {}: {open_error}; attempting rebuild from SQLite",
+                    index_path.display()
+                );
+                rebuild_index_from_db(db, &index_path).with_context(|| {
+                    format!(
+                        "rebuild ESS index at {} after open failure",
+                        index_path.display()
+                    )
+                })?;
+                EmailIndex::open(&index_path)
+                    .with_context(|| format!("re-open rebuilt ESS index at {}", index_path.display()))
+            }
+        }
+    }
+
+    fn rebuild_index_from_db(db: &Database, index_path: &Path) -> Result<usize> {
+        if index_path.exists() {
+            std::fs::remove_dir_all(index_path).with_context(|| {
+                format!("remove corrupted ESS index directory {}", index_path.display())
+            })?;
+        }
+        std::fs::create_dir_all(index_path)
+            .with_context(|| format!("create ESS index directory {}", index_path.display()))?;
+        let mut index = EmailIndex::open(index_path)
+            .with_context(|| format!("initialize ESS index at {}", index_path.display()))?;
+        let indexed = index
+            .reindex(db)
+            .context("reindex ESS index from SQLite source-of-truth")?;
+        tracing::warn!(
+            "rebuilt ESS index at {} with {indexed} indexed emails",
+            index_path.display()
+        );
+        Ok(indexed)
     }
 
     fn map_account_type(value: super::AccountTypeArg) -> AccountType {

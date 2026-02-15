@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
@@ -100,7 +101,7 @@ fn ess_search(arguments: &Value) -> Result<Value> {
     let limit = optional_usize(arguments, "limit")?.unwrap_or(20);
 
     let db = open_db()?;
-    let index = open_index()?;
+    let index = open_index_with_recovery(&db)?;
     let filters = EmailFilters {
         scope,
         from,
@@ -165,7 +166,7 @@ fn ess_recent(arguments: &Value) -> Result<Value> {
 
 fn ess_stats() -> Result<Value> {
     let db = open_db()?;
-    let index = open_index()?;
+    let index = open_index_with_recovery(&db)?;
 
     let db_stats = db.get_stats()?;
     let accounts = db.list_accounts()?;
@@ -203,10 +204,44 @@ fn open_db() -> Result<Database> {
     Database::open(&db_path).with_context(|| format!("open ESS database at {}", db_path.display()))
 }
 
-fn open_index() -> Result<EmailIndex> {
+fn open_index_with_recovery(db: &Database) -> Result<EmailIndex> {
     let index_path = EmailIndex::default_index_path().context("resolve ESS index path")?;
-    EmailIndex::open(&index_path)
-        .with_context(|| format!("open ESS index at {}", index_path.display()))
+    match EmailIndex::open(&index_path) {
+        Ok(index) => Ok(index),
+        Err(open_error) => {
+            tracing::warn!(
+                "failed to open ESS index at {}: {open_error}; attempting rebuild from SQLite",
+                index_path.display()
+            );
+            rebuild_index_from_db(db, &index_path).with_context(|| {
+                format!(
+                    "rebuild ESS index at {} after open failure",
+                    index_path.display()
+                )
+            })?;
+            EmailIndex::open(&index_path)
+                .with_context(|| format!("re-open rebuilt ESS index at {}", index_path.display()))
+        }
+    }
+}
+
+fn rebuild_index_from_db(db: &Database, index_path: &Path) -> Result<usize> {
+    if index_path.exists() {
+        std::fs::remove_dir_all(index_path)
+            .with_context(|| format!("remove corrupted ESS index directory {}", index_path.display()))?;
+    }
+    std::fs::create_dir_all(index_path)
+        .with_context(|| format!("create ESS index directory {}", index_path.display()))?;
+    let mut index = EmailIndex::open(index_path)
+        .with_context(|| format!("initialize ESS index at {}", index_path.display()))?;
+    let indexed = index
+        .reindex(db)
+        .context("reindex ESS index from SQLite source-of-truth")?;
+    tracing::warn!(
+        "rebuilt ESS index at {} with {indexed} indexed emails",
+        index_path.display()
+    );
+    Ok(indexed)
 }
 
 fn required_string(arguments: &Value, key: &str) -> Result<String> {

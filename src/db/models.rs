@@ -139,12 +139,6 @@ impl Email {
     }
 }
 
-impl<'r> From<&Row<'r>> for Email {
-    fn from(row: &Row<'r>) -> Self {
-        Self::from_row(row).expect("failed to parse Email from SQLite row")
-    }
-}
-
 impl Account {
     pub fn from_row(row: &Row<'_>) -> SqlResult<Self> {
         let account_type_raw: String = row.get("account_type")?;
@@ -169,12 +163,6 @@ impl Account {
     }
 }
 
-impl<'r> From<&Row<'r>> for Account {
-    fn from(row: &Row<'r>) -> Self {
-        Self::from_row(row).expect("failed to parse Account from SQLite row")
-    }
-}
-
 impl Contact {
     pub fn from_row(row: &Row<'_>) -> SqlResult<Self> {
         Ok(Self {
@@ -187,12 +175,6 @@ impl Contact {
             first_seen: row.get("first_seen")?,
             last_seen: row.get("last_seen")?,
         })
-    }
-}
-
-impl<'r> From<&Row<'r>> for Contact {
-    fn from(row: &Row<'r>) -> Self {
-        Self::from_row(row).expect("failed to parse Contact from SQLite row")
     }
 }
 
@@ -209,12 +191,6 @@ impl Attachment {
     }
 }
 
-impl<'r> From<&Row<'r>> for Attachment {
-    fn from(row: &Row<'r>) -> Self {
-        Self::from_row(row).expect("failed to parse Attachment from SQLite row")
-    }
-}
-
 impl SyncState {
     pub fn from_row(row: &Row<'_>) -> SqlResult<Self> {
         Ok(Self {
@@ -222,12 +198,6 @@ impl SyncState {
             value: row.get("value")?,
             updated_at: row.get("updated_at")?,
         })
-    }
-}
-
-impl<'r> From<&Row<'r>> for SyncState {
-    fn from(row: &Row<'r>) -> Self {
-        Self::from_row(row).expect("failed to parse SyncState from SQLite row")
     }
 }
 

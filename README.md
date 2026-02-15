@@ -6,6 +6,15 @@
 
 ESS is a local-first email search service with a CLI and an MCP server. It stores canonical email data in SQLite and indexes searchable content in Tantivy.
 
+**Who it's for:** Developers and AI agents that need programmatic access to email data without cloud dependencies or third-party SaaS.
+
+**Why ESS:**
+- **Local-first** — your email data stays on your machine in SQLite + Tantivy, not in someone else's cloud
+- **MCP-native** — five tools (`ess_search`, `ess_thread`, `ess_contacts`, `ess_recent`, `ess_stats`) ready for any MCP client
+- **Fast full-text search** — Tantivy provides sub-second search across thousands of emails
+- **Multi-account** — manage professional and personal accounts with scope filtering (`--scope pro`)
+- **Flexible ingest** — import JSON archives or sync live from Microsoft Graph with delta tokens
+
 ## What ESS does
 
 - Imports JSON email archives into a local SQLite database.
@@ -78,6 +87,52 @@ ess search "quarterly planning" --from alice@company.com --since 2026-01-01 --li
 ```bash
 ess show <message-id>
 ess thread <conversation-id>
+```
+
+## Example output
+
+### `ess stats`
+
+```
+ESS Stats
+=========
+Accounts: 1
+Emails:   26
+Contacts: 13
+
+Emails by account
+-----------------
+test@example.com               26
+
+Index Docs: 26
+Index Size (bytes): 6404508
+```
+
+### `ess stats --json`
+
+```json
+{
+  "database": {
+    "total_accounts": 1,
+    "total_emails": 26,
+    "total_contacts": 13,
+    "emails_by_account": [
+      { "account_id": "test@example.com", "count": 26 }
+    ]
+  },
+  "index_doc_count": 26,
+  "index_size_bytes": 6404508
+}
+```
+
+### `ess list --limit 3`
+
+```
+From                      Subject                                                   Date
+------------------------  --------------------------------------------------------  ----------
+Claude Team               Introducing Claude Opus 4.6 and agent teams               2026-02-05
+Anthropic                 Secure link to log in to Claude.ai                         2026-02-01
+Claude Team               Welcome to Claude — let's get started                     2026-01-30
 ```
 
 ## CLI reference
@@ -263,6 +318,51 @@ Example `tools/call` payload:
 }
 ```
 
+## JSON archive format
+
+ESS imports `.json` files from a directory. Each file represents one email. The connector accepts both Microsoft Graph API format and a simpler flat format.
+
+### Minimal example
+
+```json
+{
+  "id": "msg-001",
+  "subject": "Q2 Planning Kickoff",
+  "receivedDateTime": "2026-01-15T10:30:00Z",
+  "from": { "name": "Alice Chen", "address": "alice@example.com" },
+  "toRecipients": [
+    { "name": "Bob Smith", "address": "bob@example.com" }
+  ],
+  "body": { "contentType": "text", "content": "Let's schedule the kickoff for next week." },
+  "bodyPreview": "Let's schedule the kickoff for next week."
+}
+```
+
+### Field reference
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | yes | Unique message identifier |
+| `subject` | no | Email subject line |
+| `receivedDateTime` | no | ISO 8601 timestamp (falls back to `sentDateTime`, then current time) |
+| `sentDateTime` | no | When the email was sent |
+| `from` | no | Object with `name` and/or `address` (or Graph format with `emailAddress.name`/`emailAddress.address`) |
+| `toRecipients` | no | Array of recipient objects (same format as `from`) |
+| `ccRecipients` | no | Array of CC recipients |
+| `bccRecipients` | no | Array of BCC recipients |
+| `body` | no | Object with `contentType` (`"text"` or `"html"`) and `content`, or a plain string |
+| `bodyPreview` | no | Short text preview of the body |
+| `importance` | no | `"low"`, `"normal"`, or `"high"` |
+| `isRead` | no | Boolean |
+| `hasAttachments` | no | Boolean |
+| `headers` | no | Object with MIME headers (`Message-ID`, `Thread-Topic`, etc.) |
+| `conversationId` | no | Thread/conversation grouping ID |
+| `internetMessageId` | no | RFC 2822 Message-ID |
+| `categories` | no | Array of category strings |
+| `webLink` | no | URL to the message in a web client |
+
+Fields can be nested under an `"email"` wrapper object. The connector also reads MIME headers (`From`, `To`, `Cc`, `Bcc`, `Message-ID`, `Thread-Topic`) as fallbacks when top-level fields are missing.
+
 ## Configuration
 
 ESS runtime state is stored under `~/.ess/`:
@@ -355,6 +455,10 @@ Primary modules:
 - `src/db/`: SQLite models, schema, query APIs
 - `src/indexer/`: Tantivy indexing and search
 - `src/mcp/`: MCP stdio server and tools
+
+## See also
+
+- [ESM (Email Search Memory)](https://github.com/krasmussen37/ess-memory) — pattern engine companion. ESM extracts communication patterns from ESS search results and uses them to improve outbound email. Use `esm reflect` to mine patterns from ESS data, and `esm context` to get drafting guidance before writing.
 
 ## Contributing
 
