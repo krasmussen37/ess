@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+> **Reference config.** This file provides project context to AI coding agents (Claude Code, Codex, etc.). Use it as a starting point — adapt the playbooks, paths, and tool references to match your setup.
+
 ## ESS agent onboarding
 
 ESS is the Email Search Service for local-first email indexing/search with:
@@ -17,6 +19,7 @@ Primary objective when modifying ESS: keep CLI/MCP behavior stable while preserv
 - Connectors:
   - `src/connectors/json_archive.rs`
   - `src/connectors/graph_api.rs`
+  - `src/connectors/gmail_api.rs`
 - MCP:
   - `src/mcp/server.rs`
   - `src/mcp/tools.rs`
@@ -102,6 +105,13 @@ Scope parsing accepts `professional|pro|personal|all`.
 3. Handle rate limits (`429`) and transient retries safely.
 4. Ensure delete events remove records from both DB and index.
 
+### Update Gmail sync
+
+1. Edit `src/connectors/gmail_api.rs`.
+2. Preserve enumerate-diff-batch pattern and historyId watermarks.
+3. Handle rate limits (429) with exponential backoff.
+4. Use buffered writes with per-batch commit.
+
 ## Data and consistency rules
 
 - SQLite is source-of-truth for email rows.
@@ -115,6 +125,12 @@ Graph credentials are resolved from:
 - `ESS_TENANT_ID`
 - `ESS_CLIENT_ID`
 - `ESS_CLIENT_SECRET`
+- account config JSON as fallback (for per-account overrides)
+
+Gmail credentials are resolved from:
+- `ESS_GMAIL_CLIENT_ID`
+- `ESS_GMAIL_CLIENT_SECRET`
+- `ESS_GMAIL_REFRESH_TOKEN`
 - account config JSON as fallback (for per-account overrides)
 
 Do not print secrets in logs, errors, or tests.

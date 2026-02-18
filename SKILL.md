@@ -8,6 +8,8 @@ metadata:
 allowed-tools: Bash(ess:*)
 ---
 
+> **Reference skill definition.** This file defines ESS as an agent skill with CLI/MCP usage examples. Use it as a template for exposing your own tools to AI agents — adapt the commands, tool schemas, and workflows to your needs.
+
 # ESS (Email Search Service)
 
 Local-first email search. SQLite canonical store + Tantivy full-text index. CLI and MCP server.
@@ -18,7 +20,7 @@ Local-first email search. SQLite canonical store + Tantivy full-text index. CLI 
 - Retrieving full threads by conversation ID
 - Looking up contacts and communication frequency
 - Providing email context to an agent via MCP tools
-- Importing JSON email archives or syncing from Microsoft Graph
+- Importing JSON email archives or syncing from Microsoft Graph / Gmail APIs
 
 ## When NOT to Use ESS (Use ESM Instead)
 
@@ -80,8 +82,13 @@ ess accounts sync-status
 ess import ./archive --account you@co.com
 
 # Sync from Microsoft Graph
+ess sync --account work@co.com
+
+# Sync from Gmail
+ess sync --account personal@gmail.com
+
+# Sync all accounts
 ess sync
-ess sync --account you@co.com
 ess sync --watch
 ```
 

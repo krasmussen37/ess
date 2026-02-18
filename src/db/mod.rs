@@ -77,7 +77,7 @@ impl Database {
     }
 
     fn run_migrations(&mut self) -> Result<(), DbError> {
-        migrations::migrate(&mut self.conn)
+        migrations::migrate(&self.conn)
             .map_err(|e| DbError::Config(format!("migration failed: {e}")))
     }
 
@@ -211,6 +211,30 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    pub fn email_exists(&self, id: &str) -> Result<bool, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT 1 FROM emails WHERE id = ? LIMIT 1")?;
+        let exists = stmt.exists([id])?;
+        Ok(exists)
+    }
+
+    /// Return the set of all email IDs for a given account.
+    pub fn get_email_ids_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<std::collections::HashSet<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM emails WHERE account_id = ?")?;
+        let rows = stmt.query_map([account_id], |row| row.get::<_, String>(0))?;
+        let mut ids = std::collections::HashSet::new();
+        for row in rows {
+            ids.insert(row?);
+        }
+        Ok(ids)
     }
 
     pub fn get_email(&self, id: &str) -> Result<Option<Email>, DbError> {

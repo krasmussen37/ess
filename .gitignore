@@ -1,7 +1,15 @@
+# === Developer (repo hygiene) ===
 target/
+.env
+
+# === User template (common build/runtime artifacts) ===
+# Cargo builds into target/ by default — already covered above.
+# If you run ESS from the repo directory, these may appear:
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 index/
-.env
+logs/
+*.log
+config.toml

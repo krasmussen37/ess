@@ -30,3 +30,4 @@ uuid = { version = "1", features = ["v4"] }
 glob = "0.3"
 unicode-width = "0.1"
 ring = "0.17"
+base64 = "0.22"

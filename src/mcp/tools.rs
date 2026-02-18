@@ -227,8 +227,12 @@ fn open_index_with_recovery(db: &Database) -> Result<EmailIndex> {
 
 fn rebuild_index_from_db(db: &Database, index_path: &Path) -> Result<usize> {
     if index_path.exists() {
-        std::fs::remove_dir_all(index_path)
-            .with_context(|| format!("remove corrupted ESS index directory {}", index_path.display()))?;
+        std::fs::remove_dir_all(index_path).with_context(|| {
+            format!(
+                "remove corrupted ESS index directory {}",
+                index_path.display()
+            )
+        })?;
     }
     std::fs::create_dir_all(index_path)
         .with_context(|| format!("create ESS index directory {}", index_path.display()))?;
