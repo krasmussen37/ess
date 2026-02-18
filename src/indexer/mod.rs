@@ -107,6 +107,20 @@ impl EmailIndex {
         self.commit_and_reload()
     }
 
+    /// Buffer an email document without committing. Call `commit()` after a batch.
+    pub fn add_email_buffered(
+        &mut self,
+        email: &Email,
+        account_type: &str,
+    ) -> Result<(), IndexError> {
+        self.index_email_document(email, account_type)
+    }
+
+    /// Commit all buffered writes and reload the reader.
+    pub fn commit(&mut self) -> Result<(), IndexError> {
+        self.commit_and_reload()
+    }
+
     pub fn search(
         &self,
         query: &str,
@@ -295,7 +309,11 @@ impl EmailIndex {
         })
     }
 
-    fn index_email_document(&mut self, email: &Email, account_type: &str) -> Result<(), IndexError> {
+    fn index_email_document(
+        &mut self,
+        email: &Email,
+        account_type: &str,
+    ) -> Result<(), IndexError> {
         self.writer
             .delete_term(Term::from_field_text(self.fields.email_db_id, &email.id));
 

@@ -13,15 +13,58 @@ ESS is a local-first email search service with a CLI and an MCP server. It store
 - **MCP-native** — five tools (`ess_search`, `ess_thread`, `ess_contacts`, `ess_recent`, `ess_stats`) ready for any MCP client
 - **Fast full-text search** — Tantivy provides sub-second search across thousands of emails
 - **Multi-account** — manage professional and personal accounts with scope filtering (`--scope pro`)
-- **Flexible ingest** — import JSON archives or sync live from Microsoft Graph with delta tokens
+- **Flexible ingest** — import JSON archives or sync live from Microsoft Graph and Gmail APIs
 
 ## What ESS does
 
 - Imports JSON email archives into a local SQLite database.
-- Syncs Microsoft Graph mailbox data (delta sync with token caching).
+- Syncs from Microsoft Graph and Gmail APIs (delta sync with token caching).
 - Indexes email text for fast full-text search.
 - Exposes both CLI commands and MCP tools (`ess_search`, `ess_thread`, `ess_contacts`, `ess_recent`, `ess_stats`).
 - Supports multi-account setups with account-type scoping (`professional`, `personal`).
+
+### Graph folder coverage
+
+Graph sync dynamically discovers all mailbox folders via `GET /users/{email}/mailFolders` (including hidden folders). Every discovered folder is synced using delta queries, so custom folders, subfolder hierarchies, and folders created by third-party clients (e.g. Superhuman's "Done" → Archive) are all captured.
+
+Well-known folders are normalised to short ESS labels:
+
+| Display name | ESS `emails.folder` |
+|---|---|
+| Inbox | `inbox` |
+| Sent Items | `sent` |
+| Archive | `archive` |
+| Drafts | `drafts` |
+| Deleted Items | `trash` |
+| Junk Email | `spam` |
+| Outbox | `outbox` |
+| Conversation History | `conversation_history` |
+
+Custom/user-created folders use their lowercased display name as the label. Child folders use a `parent/child` path format.
+
+System folders (`Sync Issues`, `Conflicts`, `Local Failures`, `Server Failures`) and search folders are excluded automatically.
+
+Each folder has its own delta cursor in `sync_state` keyed by folder ID:
+- `graph_delta_link:{account_id}:{folder_id}`
+
+Legacy delta cursors (well-known name keys and pre-multi-folder inbox keys) are migrated automatically on next sync.
+
+### Sync strategy
+
+Initial sync uses the Graph `/messages` endpoint to enumerate all messages in each folder, then establishes a delta baseline for future incremental syncs. Subsequent syncs use delta queries, which are fast (typically seconds) and only fetch new/changed/deleted messages.
+
+Meeting invite notifications (subjects like "Updated invitation: ...", "Accepted: ...") are `eventMessage` types in the Graph API. They inherit from `message` and are returned by `/messages`, so ESS syncs them alongside regular email. Calendar **events** (structured start/end times, attendees, RSVP) are separate Graph API resources and are not part of email sync.
+
+### Item count discrepancy
+
+The Graph API `totalItemCount` on a folder counts **all item types** (emails, calendar items, tasks, FAI), not just messages. The `/messages` endpoint returns only email-type items. This means `totalItemCount` will typically exceed the actual number of synced emails. Additionally, the `Deleted Items` folder's `totalItemCount` includes Recoverable Items (soft-deleted dumpster) which are not accessible via the Graph API.
+
+ESS uses `/messages` pagination count as the source of truth, not `totalItemCount`.
+
+### Known limitations
+
+- The Exchange Online In-Place Archive (Online Archive mailbox) is not accessible via Microsoft Graph API (v1.0 or beta). This is a Microsoft platform limitation. Superhuman's "Done" action uses the primary mailbox's Archive folder, which is synced normally.
+- Recoverable Items in `Deleted Items` (permanently deleted items still in retention hold) are not accessible via the Graph API and are not synced.
 
 ## Prerequisites
 
@@ -29,6 +72,8 @@ ESS is a local-first email search service with a CLI and an MCP server. It store
 - Linux/macOS shell
 - Optional for Graph sync:
   - Microsoft Graph app credentials (`ESS_CLIENT_ID`, `ESS_CLIENT_SECRET`, `ESS_TENANT_ID`)
+- Optional for Gmail sync:
+  - Google OAuth credentials (`ESS_GMAIL_CLIENT_ID`, `ESS_GMAIL_CLIENT_SECRET`, `ESS_GMAIL_REFRESH_TOKEN`) or per-account `--config` JSON
 
 ## Installation
 
@@ -96,16 +141,17 @@ ess thread <conversation-id>
 ```
 ESS Stats
 =========
-Accounts: 1
-Emails:   26
-Contacts: 13
+Accounts: 2
+Emails:   12500
+Contacts: 1830
 
 Emails by account
 -----------------
-test@example.com               26
+you@company.com                10200
+personal@gmail.com              2300
 
-Index Docs: 26
-Index Size (bytes): 6404508
+Index Docs: 12500
+Index Size (bytes): 536870912
 ```
 
 ### `ess stats --json`
@@ -113,15 +159,16 @@ Index Size (bytes): 6404508
 ```json
 {
   "database": {
-    "total_accounts": 1,
-    "total_emails": 26,
-    "total_contacts": 13,
+    "total_accounts": 2,
+    "total_emails": 12500,
+    "total_contacts": 1830,
     "emails_by_account": [
-      { "account_id": "test@example.com", "count": 26 }
+      { "account_id": "you@company.com", "count": 10200 },
+      { "account_id": "personal@gmail.com", "count": 2300 }
     ]
   },
-  "index_doc_count": 26,
-  "index_size_bytes": 6404508
+  "index_doc_count": 12500,
+  "index_size_bytes": 536870912
 }
 ```
 
@@ -193,12 +240,19 @@ ess thread AAQkAG...
 
 ### `ess sync`
 
-Sync configured accounts from Microsoft Graph.
+Sync configured accounts from Microsoft Graph and Gmail.
 
 Examples:
 ```bash
+# Sync all accounts
 ess sync
-ess sync --account you@company.com
+
+# Sync from Microsoft Graph
+ess sync --account work@company.com
+
+# Sync from Gmail
+ess sync --account personal@gmail.com
+
 ess sync --watch
 ```
 
@@ -279,7 +333,7 @@ ess mcp
 
 ## MCP setup
 
-Add ESS to your MCP client config:
+A reference `.mcp.json` is included in the repo as a starting point. Add ESS to your MCP client config:
 
 ```json
 {
@@ -411,6 +465,76 @@ ess search "invoice" --scope pro
 ess list --scope personal
 ```
 
+## Sync best practices
+
+### Initial sync / archive build-up
+
+When populating ESS for the first time with real email data:
+
+**Run syncs sequentially, one account at a time.** The Tantivy search index only supports one writer process. Running two `ess sync` commands concurrently will cause the second to fail with an index lock error.
+
+```bash
+# Correct: sequential
+ess sync --account work@company.com
+ess sync --account personal@gmail.com
+
+# Wrong: concurrent (will fail)
+ess sync --account work@company.com &
+ess sync --account personal@gmail.com &  # index lock error
+```
+
+**Gmail initial syncs are slow for large mailboxes.** The Gmail API requires one HTTP request per message during full sync. A mailbox with 20,000 emails will take a while. ESS refreshes the OAuth token automatically during long syncs, so token expiry is handled. Monitor progress with:
+
+```bash
+ess stats --json  # check email counts while sync runs
+```
+
+**Interrupted syncs are safe to restart.** SQLite upserts prevent duplicate emails. If a sync fails partway through, simply re-run it. The sync will re-enumerate messages but skip those already stored. However, for Gmail, the `historyId` watermark isn't saved until the full sync completes, so restarts redo the full `messages.list` enumeration.
+
+**Per-account credentials go in `--config` JSON.** When different accounts use different OAuth apps (e.g., two Gmail accounts from different Google Cloud projects), pass per-account credentials via `--config`:
+
+```bash
+ess accounts add user@gmail.com personal \
+  --config '{"connector":"gmail_api","client_id":"...","client_secret":"...","refresh_token":"..."}'
+```
+
+Credentials are stored in the local SQLite database (`~/.ess/ess.db`), never committed to git.
+
+**Rebuild the index after problems.** If a sync was killed mid-write or the index shows corruption (merge errors, missing segments), rebuild from SQLite:
+
+```bash
+rm -rf ~/.ess/index
+ess reindex
+```
+
+SQLite is the source of truth. The index can always be rebuilt.
+
+### Ongoing sync and indexing
+
+After the initial load completes:
+
+**Delta syncs are fast.** Gmail uses `historyId` and Graph uses delta tokens for incremental sync. Only new/changed/deleted messages are fetched. A typical delta sync takes seconds.
+
+**Graph keeps one delta token per folder.** This prevents cross-folder cursor conflicts and allows inbox/sent/archive/drafts/trash/spam to advance independently.
+
+**Use `--watch` for automatic periodic syncing:**
+
+```bash
+ess sync --watch  # polls for changes on a timer
+```
+
+**Never run multiple sync processes simultaneously.** The Tantivy index writer is exclusive. Use `ess sync` (no `--account` flag) to sync all accounts sequentially in one process.
+
+**If search results seem stale or incomplete,** rebuild the index:
+
+```bash
+ess reindex  # rebuilds from SQLite, no data loss
+```
+
+**Expired delta tokens trigger automatic fallback.** If a Gmail `historyId` or Graph delta token expires (too long between syncs), ESS falls back to a full sync automatically. A warning is logged but no manual intervention is needed.
+
+**Index sizing:** Expect roughly 0.3-0.5 GB of index per 1,000 emails (varies with email body sizes). A 20K email corpus produces a ~6-9 GB Tantivy index.
+
 ## Scope filtering
 
 `--scope` controls account-type filtering:
@@ -431,7 +555,8 @@ ess stats --scope all
 
 ```text
                 +--------------------+
-                |  Graph API / JSON  |
+                |  Graph API / Gmail |
+                |  API / JSON        |
                 |     Connectors     |
                 +---------+----------+
                           |
@@ -451,7 +576,7 @@ ess stats --scope all
 
 Primary modules:
 - `src/main.rs`: CLI dispatch
-- `src/connectors/`: Graph + JSON import connectors
+- `src/connectors/`: Graph API, Gmail API, and JSON import connectors
 - `src/db/`: SQLite models, schema, query APIs
 - `src/indexer/`: Tantivy indexing and search
 - `src/mcp/`: MCP stdio server and tools
@@ -482,3 +607,4 @@ cargo run -- --help
 
 - Keep logging on stderr so JSON outputs remain parseable.
 - Preserve UTF-8-safe snippet handling in search formatting.
+- The `.gitignore` includes common build and runtime artifacts you should expect when working with the repo. Review it when setting up your environment.

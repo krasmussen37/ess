@@ -426,8 +426,12 @@ fn stable_hash_hex(input: &str) -> String {
 }
 
 fn html_to_text(html: &str) -> String {
-    let rendered = html2text::from_read(html.as_bytes(), 120);
-    rendered.trim().to_string()
+    std::panic::catch_unwind(|| {
+        html2text::from_read(html.as_bytes(), 120)
+            .trim()
+            .to_string()
+    })
+    .unwrap_or_default()
 }
 
 fn looks_like_html(value: &str) -> bool {

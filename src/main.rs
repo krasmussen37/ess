@@ -122,6 +122,9 @@ enum AccountCommands {
         account_type: AccountTypeArg,
         #[arg(long)]
         tenant_id: Option<String>,
+        /// JSON config object (e.g. '{"connector": "gmail_api"}')
+        #[arg(long)]
+        config: Option<String>,
     },
     /// Remove account configuration
     Remove { account_id: String },
@@ -151,7 +154,9 @@ mod commands {
     use chrono::NaiveDate;
     use serde::Serialize;
 
-    use ess::connectors::{EmailConnector, GraphApiConnector, JsonArchiveConnector};
+    use ess::connectors::{
+        EmailConnector, GmailApiConnector, GraphApiConnector, JsonArchiveConnector,
+    };
     use ess::db::models::{Account, AccountType};
     use ess::db::{Database, EmailSearchFilters};
     use ess::indexer::EmailIndex;
@@ -267,7 +272,6 @@ mod commands {
         let db = Database::open(&db_path)
             .with_context(|| format!("open ESS database at {}", db_path.display()))?;
         let mut index = open_index_with_recovery(&db)?;
-        let connector = GraphApiConnector::new();
         let accounts = resolve_accounts(&db, args.account.as_deref())?;
 
         if args.full {
@@ -276,11 +280,11 @@ mod commands {
 
         if args.watch {
             loop {
-                run_sync_cycle(&connector, &db, &mut index, &accounts).await?;
+                run_sync_cycle_multi(&db, &mut index, &accounts).await?;
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         } else {
-            run_sync_cycle(&connector, &db, &mut index, &accounts).await
+            run_sync_cycle_multi(&db, &mut index, &accounts).await
         }
     }
 
@@ -353,7 +357,14 @@ mod commands {
                 email,
                 account_type,
                 tenant_id,
+                config,
             } => {
+                let parsed_config = config
+                    .map(|raw| {
+                        serde_json::from_str::<serde_json::Value>(&raw)
+                            .context("parse --config JSON")
+                    })
+                    .transpose()?;
                 let account = Account {
                     account_id: email.trim().to_ascii_lowercase(),
                     email_address: email,
@@ -362,7 +373,7 @@ mod commands {
                     account_type: map_account_type(account_type),
                     enabled: true,
                     last_sync: None,
-                    config: None,
+                    config: parsed_config,
                 };
                 db.insert_account(&account)?;
                 println!("Added account: {}", account.account_id);
@@ -480,8 +491,9 @@ mod commands {
                         index_path.display()
                     )
                 })?;
-                EmailIndex::open(&index_path)
-                    .with_context(|| format!("re-open rebuilt ESS index at {}", index_path.display()))
+                EmailIndex::open(&index_path).with_context(|| {
+                    format!("re-open rebuilt ESS index at {}", index_path.display())
+                })
             }
         }
     }
@@ -489,7 +501,10 @@ mod commands {
     fn rebuild_index_from_db(db: &Database, index_path: &Path) -> Result<usize> {
         if index_path.exists() {
             std::fs::remove_dir_all(index_path).with_context(|| {
-                format!("remove corrupted ESS index directory {}", index_path.display())
+                format!(
+                    "remove corrupted ESS index directory {}",
+                    index_path.display()
+                )
             })?;
         }
         std::fs::create_dir_all(index_path)
@@ -549,13 +564,27 @@ mod commands {
         }
     }
 
-    async fn run_sync_cycle(
-        connector: &GraphApiConnector,
+    fn connector_for_account(account: &Account) -> Box<dyn EmailConnector> {
+        let connector_name = account
+            .config
+            .as_ref()
+            .and_then(|c| c.get("connector"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("graph_api");
+
+        match connector_name {
+            "gmail_api" => Box::new(GmailApiConnector::new()),
+            _ => Box::new(GraphApiConnector::new()),
+        }
+    }
+
+    async fn run_sync_cycle_multi(
         db: &Database,
         index: &mut EmailIndex,
         accounts: &[Account],
     ) -> Result<()> {
         for account in accounts {
+            let connector = connector_for_account(account);
             let report = connector.sync(db, index, account).await?;
             println!(
                 "sync {}: added={} updated={} errors={}",
@@ -564,6 +593,15 @@ mod commands {
                 report.emails_updated,
                 report.errors.len()
             );
+            if !report.errors.is_empty() {
+                let show = report.errors.len().min(10);
+                for error in &report.errors[..show] {
+                    eprintln!("  error: {error}");
+                }
+                if report.errors.len() > 10 {
+                    eprintln!("  ... and {} more errors", report.errors.len() - 10);
+                }
+            }
         }
         Ok(())
     }

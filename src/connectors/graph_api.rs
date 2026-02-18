@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client, StatusCode, Url};
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use tokio::time::sleep;
@@ -20,7 +20,8 @@ use crate::indexer::EmailIndex;
 const GRAPH_SCOPE: &str = "https://graph.microsoft.com/.default";
 const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0";
 const CACHE_SKEW_SECONDS: i64 = 60;
-const DEFAULT_DELTA_PAGE_SIZE: usize = 50;
+const DEFAULT_DELTA_PAGE_SIZE: usize = 200;
+const FULL_SYNC_PAGE_SIZE: usize = 250;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 const TOKEN_CACHE_ENCRYPTION_KEY_ENV: &str = "ESS_TOKEN_CACHE_KEY";
 const TOKEN_CACHE_KEY_BYTES: usize = 32;
@@ -28,6 +29,91 @@ const TOKEN_CACHE_NONCE_BYTES: usize = 12;
 const TOKEN_CACHE_ENVELOPE_VERSION: u8 = 1;
 
 const REDACTED_BODY_MAX_LEN: usize = 200;
+
+/// A folder discovered at runtime via the Graph API mailFolders endpoint.
+#[derive(Debug, Clone)]
+struct DiscoveredFolder {
+    /// Graph API folder ID (used in delta URLs and sync_state keys).
+    folder_id: String,
+    /// Human-readable folder name from the API (e.g. "Inbox", "Sent Items").
+    display_name: String,
+    /// Normalised label stored in ESS `emails.folder` column.
+    ess_label: String,
+}
+
+/// Normalise a Graph API folder display name into an ESS folder label.
+/// Well-known folders map to short canonical names; custom folders use
+/// their lowercased display name as-is.
+fn normalize_folder_label(display_name: &str) -> String {
+    match display_name.trim().to_lowercase().as_str() {
+        "inbox" => "inbox",
+        "sent items" => "sent",
+        "archive" => "archive",
+        "drafts" => "drafts",
+        "deleted items" => "trash",
+        "junk email" => "spam",
+        "outbox" => "outbox",
+        "conversation history" => "conversation_history",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// System/infrastructure folders that don't contain user mail.
+const EXCLUDED_FOLDER_NAMES: &[&str] = &[
+    "sync issues",
+    "conflicts",
+    "local failures",
+    "server failures",
+];
+
+fn is_excluded_folder(display_name: &str) -> bool {
+    let lower = display_name.trim().to_lowercase();
+    EXCLUDED_FOLDER_NAMES
+        .iter()
+        .any(|&excluded| lower == excluded)
+}
+
+/// Map from well-known display name to the legacy graph_name used in delta
+/// link keys (pre-dynamic-discovery). Used for one-time migration so existing
+/// delta cursors are preserved and the 6 previously-synced folders don't
+/// re-enumerate from scratch.
+fn legacy_delta_key_name(display_name: &str) -> Option<&'static str> {
+    match display_name.trim().to_lowercase().as_str() {
+        "inbox" => Some("inbox"),
+        "sent items" => Some("sentitems"),
+        "archive" => Some("archive"),
+        "drafts" => Some("drafts"),
+        "deleted items" => Some("deleteditems"),
+        "junk email" => Some("junkemail"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GraphMailFolder {
+    id: String,
+    #[serde(rename = "displayName")]
+    display_name: String,
+    #[serde(rename = "parentFolderId")]
+    #[allow(dead_code)]
+    parent_folder_id: Option<String>,
+    #[serde(rename = "childFolderCount")]
+    child_folder_count: Option<i32>,
+    #[serde(rename = "totalItemCount")]
+    #[allow(dead_code)]
+    total_item_count: Option<i32>,
+    #[serde(rename = "isHidden")]
+    #[allow(dead_code)]
+    is_hidden: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GraphMailFolderPage {
+    value: Vec<GraphMailFolder>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
 
 const MESSAGE_SELECT_FIELDS: &str = concat!(
     "id,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,",
@@ -68,7 +154,18 @@ impl GraphApiConnector {
         format!("graph_api_token:{}", account.account_id)
     }
 
-    fn delta_link_key(account: &Account) -> String {
+    fn delta_link_key(account: &Account, folder_id: &str) -> String {
+        format!("graph_delta_link:{}:{}", account.account_id, folder_id)
+    }
+
+    /// Legacy key format using well-known graph_name (pre-dynamic-discovery).
+    fn legacy_wellknown_delta_link_key(account: &Account, graph_name: &str) -> String {
+        format!("graph_delta_link:{}:{}", account.account_id, graph_name)
+    }
+
+    /// Legacy key format (pre-multi-folder). Used for one-time migration of
+    /// existing inbox delta links so users don't re-sync their entire inbox.
+    fn legacy_delta_link_key(account: &Account) -> String {
         format!("graph_delta_link:{}", account.account_id)
     }
 
@@ -140,9 +237,7 @@ impl GraphApiConnector {
         raw.map(|value| parse_token_cache_key_hex(&value))
             .transpose()
             .with_context(|| {
-                format!(
-                    "{TOKEN_CACHE_ENCRYPTION_KEY_ENV} must be 64 hex characters (32 bytes)"
-                )
+                format!("{TOKEN_CACHE_ENCRYPTION_KEY_ENV} must be 64 hex characters (32 bytes)")
             })
     }
 
@@ -153,30 +248,83 @@ impl GraphApiConnector {
         Ok(())
     }
 
-    fn load_delta_link(&self, db: &Database, account: &Account) -> Result<Option<String>> {
-        let key = Self::delta_link_key(account);
-        Ok(db
+    fn load_delta_link(
+        &self,
+        db: &Database,
+        account: &Account,
+        folder: &DiscoveredFolder,
+    ) -> Result<Option<String>> {
+        let key = Self::delta_link_key(account, &folder.folder_id);
+        let value = db
             .get_sync_state(&key)?
             .and_then(|state| state.value)
             .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()))
+            .filter(|value| !value.is_empty());
+
+        if value.is_some() {
+            return Ok(value);
+        }
+
+        // Migration layer 1: well-known-name key → folder-ID key.
+        // Before dynamic discovery, delta keys used the well-known graph_name
+        // (e.g. "inbox", "sentitems"). Migrate those to the new folder-ID key.
+        if let Some(legacy_name) = legacy_delta_key_name(&folder.display_name) {
+            let legacy_wk_key = Self::legacy_wellknown_delta_link_key(account, legacy_name);
+            if let Some(legacy_value) = db
+                .get_sync_state(&legacy_wk_key)?
+                .and_then(|state| state.value)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                db.set_sync_state(&key, &legacy_value)
+                    .context("migrate well-known delta link to folder-ID key")?;
+                Self::clear_sync_state(db, &legacy_wk_key)?;
+                return Ok(Some(legacy_value));
+            }
+        }
+
+        // Migration layer 2: un-scoped inbox key → folder-ID key.
+        // The very first version of Graph sync used a single key with no folder
+        // suffix. This only applies to the inbox folder.
+        if folder.display_name.trim().eq_ignore_ascii_case("inbox") {
+            let legacy_key = Self::legacy_delta_link_key(account);
+            if let Some(legacy_value) = db
+                .get_sync_state(&legacy_key)?
+                .and_then(|state| state.value)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            {
+                db.set_sync_state(&key, &legacy_value)
+                    .context("migrate legacy inbox delta link")?;
+                Self::clear_sync_state(db, &legacy_key)?;
+                return Ok(Some(legacy_value));
+            }
+        }
+
+        Ok(None)
     }
 
-    fn store_delta_link(&self, db: &Database, account: &Account, delta_link: &str) -> Result<()> {
-        let key = Self::delta_link_key(account);
+    fn store_delta_link(
+        &self,
+        db: &Database,
+        account: &Account,
+        folder: &DiscoveredFolder,
+        delta_link: &str,
+    ) -> Result<()> {
+        let key = Self::delta_link_key(account, &folder.folder_id);
         db.set_sync_state(&key, delta_link)
             .context("persist graph delta link")
     }
 
-    fn initial_delta_url(&self, account: &Account) -> Result<String> {
+    fn initial_delta_url(&self, account: &Account, folder: &DiscoveredFolder) -> Result<String> {
         let base = std::env::var("ESS_GRAPH_API_BASE")
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| GRAPH_API_BASE.to_string());
 
         let endpoint = format!(
-            "{base}/users/{}/mailFolders/inbox/messages/delta",
-            account.email_address
+            "{base}/users/{}/mailFolders/{}/messages/delta",
+            account.email_address, folder.folder_id
         );
         let mut url =
             Url::parse(&endpoint).with_context(|| format!("parse graph URL {endpoint}"))?;
@@ -242,7 +390,7 @@ impl GraphApiConnector {
                 .header("accept", "application/json")
                 .send()
                 .await
-                .with_context(|| format!("request graph delta page: {url}"))?;
+                .context("request graph delta page")?;
 
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 if attempt == MAX_RATE_LIMIT_RETRIES {
@@ -289,11 +437,394 @@ impl GraphApiConnector {
         Err(anyhow!("graph delta request failed without response"))
     }
 
-    fn apply_message(
+    async fn fetch_folder_page_with_retry(
+        &self,
+        token: &str,
+        url: &str,
+    ) -> Result<GraphMailFolderPage> {
+        let mut backoff_seconds = 1u64;
+
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            let response = self
+                .client
+                .get(url)
+                .bearer_auth(token)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .context("request graph mailFolders page")?;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                if attempt == MAX_RATE_LIMIT_RETRIES {
+                    let body = response
+                        .text()
+                        .await
+                        .context("read graph 429 response body")?;
+                    return Err(anyhow!(
+                        "graph mailFolders request exhausted retries: {}",
+                        redact_response_body(&body)
+                    ));
+                }
+
+                let retry_after_seconds = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(backoff_seconds);
+
+                sleep(StdDuration::from_secs(retry_after_seconds)).await;
+                backoff_seconds = (backoff_seconds * 2).min(32);
+                continue;
+            }
+
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("read graph mailFolders response body")?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "graph mailFolders request failed: status={} body={}",
+                    status,
+                    redact_response_body(&body)
+                ));
+            }
+
+            let page: GraphMailFolderPage =
+                serde_json::from_str(&body).context("decode graph mailFolders page JSON")?;
+            return Ok(page);
+        }
+
+        Err(anyhow!("graph mailFolders request failed without response"))
+    }
+
+    async fn discover_folders(
+        &self,
+        db: &Database,
+        account: &Account,
+    ) -> Result<Vec<DiscoveredFolder>> {
+        let token = self.get_access_token(db, account).await?;
+        let base = std::env::var("ESS_GRAPH_API_BASE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| GRAPH_API_BASE.to_string());
+
+        let mut folders = Vec::new();
+        let mut pending_parents: Vec<(String, String)> = Vec::new(); // (folder_id, display_name)
+
+        // Fetch top-level folders
+        let mut url = format!(
+            "{base}/users/{}/mailFolders?includeHiddenFolders=true&$top=100",
+            account.email_address
+        );
+
+        loop {
+            let page = self.fetch_folder_page_with_retry(&token, &url).await?;
+            for folder in &page.value {
+                if is_excluded_folder(&folder.display_name) {
+                    continue;
+                }
+                // Skip search folders (virtual folders that would create duplicates)
+                if folder.display_name.eq_ignore_ascii_case("searchfolders") {
+                    continue;
+                }
+
+                let ess_label = normalize_folder_label(&folder.display_name);
+                folders.push(DiscoveredFolder {
+                    folder_id: folder.id.clone(),
+                    display_name: folder.display_name.clone(),
+                    ess_label,
+                });
+
+                if folder.child_folder_count.unwrap_or(0) > 0 {
+                    pending_parents.push((folder.id.clone(), folder.display_name.clone()));
+                }
+            }
+
+            match page.next_link {
+                Some(next) => url = next,
+                None => break,
+            }
+        }
+
+        // Recursively fetch child folders
+        while let Some((parent_id, parent_name)) = pending_parents.pop() {
+            let mut child_url = format!(
+                "{base}/users/{}/mailFolders/{}/childFolders?includeHiddenFolders=true&$top=100",
+                account.email_address, parent_id
+            );
+
+            loop {
+                let page = self
+                    .fetch_folder_page_with_retry(&token, &child_url)
+                    .await?;
+                for child in &page.value {
+                    if is_excluded_folder(&child.display_name) {
+                        continue;
+                    }
+
+                    let ess_label = format!(
+                        "{}/{}",
+                        normalize_folder_label(&parent_name),
+                        child.display_name.trim().to_lowercase()
+                    );
+                    folders.push(DiscoveredFolder {
+                        folder_id: child.id.clone(),
+                        display_name: format!("{}/{}", parent_name, child.display_name),
+                        ess_label,
+                    });
+
+                    if child.child_folder_count.unwrap_or(0) > 0 {
+                        pending_parents.push((
+                            child.id.clone(),
+                            format!("{}/{}", parent_name, child.display_name),
+                        ));
+                    }
+                }
+
+                match page.next_link {
+                    Some(next) => child_url = next,
+                    None => break,
+                }
+            }
+        }
+
+        eprintln!(
+            "graph: discovered {} folders for {}",
+            folders.len(),
+            account.account_id
+        );
+        for f in &folders {
+            eprintln!("  {} → label={}", f.display_name, f.ess_label);
+        }
+
+        Ok(folders)
+    }
+
+    async fn fetch_messages_page_with_retry(
+        &self,
+        token: &str,
+        url: &str,
+    ) -> Result<GraphMessagesPage> {
+        let mut backoff_seconds = 1u64;
+
+        for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+            let response = self
+                .client
+                .get(url)
+                .bearer_auth(token)
+                .header("accept", "application/json")
+                .send()
+                .await
+                .context("request graph messages page")?;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                if attempt == MAX_RATE_LIMIT_RETRIES {
+                    let body = response
+                        .text()
+                        .await
+                        .context("read graph 429 response body")?;
+                    return Err(anyhow!(
+                        "graph messages request exhausted retries: {}",
+                        redact_response_body(&body)
+                    ));
+                }
+
+                let retry_after_seconds = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(backoff_seconds);
+
+                sleep(StdDuration::from_secs(retry_after_seconds)).await;
+                backoff_seconds = (backoff_seconds * 2).min(32);
+                continue;
+            }
+
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("read graph messages response body")?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "graph messages request failed: status={} body={}",
+                    status,
+                    redact_response_body(&body)
+                ));
+            }
+
+            let page: GraphMessagesPage =
+                serde_json::from_str(&body).context("decode graph messages page JSON")?;
+            return Ok(page);
+        }
+
+        Err(anyhow!("graph messages request failed without response"))
+    }
+
+    /// Full enumeration of all messages in a folder via the plain /messages
+    /// endpoint. Used for initial sync because the delta endpoint has a known
+    /// Microsoft bug that caps initial results.
+    async fn full_enumerate_folder(
         &self,
         db: &Database,
         indexer: &mut EmailIndex,
         account: &Account,
+        folder: &DiscoveredFolder,
+    ) -> Result<SyncReport> {
+        let mut report = SyncReport::default();
+
+        let base = std::env::var("ESS_GRAPH_API_BASE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| GRAPH_API_BASE.to_string());
+
+        let endpoint = format!(
+            "{base}/users/{}/mailFolders/{}/messages",
+            account.email_address, folder.folder_id
+        );
+        let mut url =
+            Url::parse(&endpoint).with_context(|| format!("parse graph URL {endpoint}"))?;
+        url.query_pairs_mut()
+            .append_pair("$top", &FULL_SYNC_PAGE_SIZE.to_string())
+            .append_pair("$select", MESSAGE_SELECT_FIELDS)
+            .append_pair("$orderby", "receivedDateTime desc");
+        let mut next_url = url.to_string();
+        let mut page_number = 0u64;
+
+        let mut consecutive_errors = 0u32;
+        const MAX_CONSECUTIVE_PAGE_ERRORS: u32 = 3;
+
+        loop {
+            let token = self.get_access_token(db, account).await?;
+            let page = match self
+                .fetch_messages_page_with_retry(&token, &next_url)
+                .await
+            {
+                Ok(page) => {
+                    consecutive_errors = 0;
+                    page
+                }
+                Err(error) => {
+                    consecutive_errors += 1;
+                    report.errors.push(format!(
+                        "folder={} page_fetch_error: {error}",
+                        folder.ess_label
+                    ));
+                    eprintln!(
+                        "graph full-sync {} folder={}: page fetch error ({}/{}): {error}",
+                        account.account_id,
+                        folder.ess_label,
+                        consecutive_errors,
+                        MAX_CONSECUTIVE_PAGE_ERRORS,
+                    );
+                    if consecutive_errors >= MAX_CONSECUTIVE_PAGE_ERRORS {
+                        eprintln!(
+                            "graph full-sync {} folder={}: aborting after {} consecutive page errors",
+                            account.account_id,
+                            folder.ess_label,
+                            consecutive_errors,
+                        );
+                        break;
+                    }
+                    // The nextLink URL is opaque — we can't skip a page. If
+                    // we fail to parse the current page we have no nextLink
+                    // to advance to, so we must stop.
+                    break;
+                }
+            };
+
+            page_number += 1;
+            let page_size = page.value.len();
+
+            for message in &page.value {
+                match self.apply_message_buffered(db, indexer, account, folder, message) {
+                    Ok(ApplyResult::Added) => report.emails_added += 1,
+                    Ok(ApplyResult::Updated | ApplyResult::Deleted) => report.emails_updated += 1,
+                    Err(error) => {
+                        let message_id = message.id.as_deref().unwrap_or("<missing-id>");
+                        report.errors.push(format!(
+                            "folder={} id={message_id}: {error}",
+                            folder.ess_label
+                        ));
+                    }
+                }
+            }
+
+            indexer
+                .commit()
+                .with_context(|| format!("commit index after page {page_number}"))?;
+
+            eprintln!(
+                "graph full-sync {} folder={} ({}): page {} ({} messages), added={} updated={} errors={}",
+                account.account_id,
+                folder.ess_label,
+                folder.display_name,
+                page_number,
+                page_size,
+                report.emails_added,
+                report.emails_updated,
+                report.errors.len(),
+            );
+
+            match page.next_link {
+                Some(url) => next_url = url,
+                None => break,
+            }
+        }
+
+        // After full enumeration, obtain a delta baseline token for future
+        // incremental syncs. This re-enumerates messages (treated as upserts)
+        // but the goal is to capture the deltaLink.
+        eprintln!(
+            "graph full-sync {} folder={}: obtaining delta baseline",
+            account.account_id, folder.ess_label
+        );
+        let delta_url = self.initial_delta_url(account, folder)?;
+        let mut next_delta_url = delta_url;
+        let mut newest_delta_link: Option<String> = None;
+
+        loop {
+            let token = self.get_access_token(db, account).await?;
+            let page = self
+                .fetch_delta_page_with_retry(&token, &next_delta_url)
+                .await?;
+
+            // Process messages as upserts (mostly no-ops since we just enumerated)
+            for message in &page.value {
+                let _ = self.apply_message_buffered(db, indexer, account, folder, message);
+            }
+            indexer.commit().context("commit index during delta baseline")?;
+
+            if let Some(delta_link) = page.delta_link {
+                newest_delta_link = Some(delta_link);
+            }
+
+            match page.next_link {
+                Some(url) => next_delta_url = url,
+                None => break,
+            }
+        }
+
+        if let Some(delta_link) = newest_delta_link {
+            self.store_delta_link(db, account, folder, &delta_link)?;
+            eprintln!(
+                "graph full-sync {} folder={}: delta baseline saved",
+                account.account_id, folder.ess_label
+            );
+        }
+
+        Ok(report)
+    }
+
+    fn apply_message_buffered(
+        &self,
+        db: &Database,
+        indexer: &mut EmailIndex,
+        account: &Account,
+        folder: &DiscoveredFolder,
         message: &GraphMessage,
     ) -> Result<ApplyResult> {
         if message.removed.is_some() {
@@ -310,7 +841,7 @@ impl GraphApiConnector {
             return Ok(ApplyResult::Deleted);
         }
 
-        let email = map_graph_message_to_email(message, account)?;
+        let email = map_graph_message_to_email(message, account, folder)?;
         let existed = db
             .get_email(&email.id)
             .with_context(|| format!("check existing email {}", email.id))?
@@ -319,7 +850,7 @@ impl GraphApiConnector {
         db.insert_email(&email)
             .with_context(|| format!("upsert graph email {}", email.id))?;
         indexer
-            .add_email(&email, &account.account_type.to_string())
+            .add_email_buffered(&email, &account.account_type.to_string())
             .with_context(|| format!("index graph email {}", email.id))?;
         update_contact_stats(db, &email)?;
 
@@ -328,6 +859,91 @@ impl GraphApiConnector {
         } else {
             Ok(ApplyResult::Added)
         }
+    }
+
+    async fn sync_folder(
+        &self,
+        db: &Database,
+        indexer: &mut EmailIndex,
+        account: &Account,
+        folder: &DiscoveredFolder,
+    ) -> Result<SyncReport> {
+        // If no delta link exists, this is an initial sync — use full
+        // enumeration via the /messages endpoint (the delta endpoint has a
+        // known Microsoft bug that caps initial results).
+        let existing_delta_link = self.load_delta_link(db, account, folder)?;
+        if existing_delta_link.is_none() {
+            return self
+                .full_enumerate_folder(db, indexer, account, folder)
+                .await;
+        }
+
+        let mut report = SyncReport::default();
+
+        let mut next_url = existing_delta_link.unwrap();
+        let mut newest_delta_link: Option<String> = None;
+        let mut page_number = 0u64;
+
+        loop {
+            // Refresh token per page to avoid expiry during long syncs
+            let token = self.get_access_token(db, account).await?;
+
+            let page = self.fetch_delta_page_with_retry(&token, &next_url).await?;
+            page_number += 1;
+            let page_size = page.value.len();
+
+            for message in &page.value {
+                match self.apply_message_buffered(db, indexer, account, folder, message) {
+                    Ok(ApplyResult::Added) => report.emails_added += 1,
+                    Ok(ApplyResult::Updated | ApplyResult::Deleted) => report.emails_updated += 1,
+                    Err(error) => {
+                        let message_id = message.id.as_deref().unwrap_or("<missing-id>");
+                        let removed_reason = message
+                            .removed
+                            .as_ref()
+                            .and_then(|removed| removed.reason.as_deref())
+                            .unwrap_or("-");
+                        report.errors.push(format!(
+                            "folder={} id={message_id} removed_reason={removed_reason}: {error}",
+                            folder.ess_label
+                        ));
+                    }
+                }
+            }
+
+            // Commit the index once per page (not per message)
+            indexer
+                .commit()
+                .with_context(|| format!("commit index after page {page_number}"))?;
+
+            eprintln!(
+                "graph sync {} folder={} ({}): page {} ({} messages), added={} updated={} errors={}",
+                account.account_id,
+                folder.ess_label,
+                folder.display_name,
+                page_number,
+                page_size,
+                report.emails_added,
+                report.emails_updated,
+                report.errors.len(),
+            );
+
+            if let Some(delta_link) = page.delta_link {
+                newest_delta_link = Some(delta_link);
+            }
+
+            if let Some(url) = page.next_link {
+                next_url = url;
+                continue;
+            }
+            break;
+        }
+
+        if let Some(delta_link) = newest_delta_link {
+            self.store_delta_link(db, account, folder, &delta_link)?;
+        }
+
+        Ok(report)
     }
 }
 
@@ -374,7 +990,11 @@ fn redact_response_body(body: &str) -> String {
     if trimmed.len() <= REDACTED_BODY_MAX_LEN {
         trimmed.to_string()
     } else {
-        format!("{}…[truncated {} bytes]", &trimmed[..REDACTED_BODY_MAX_LEN], trimmed.len())
+        format!(
+            "{}…[truncated {} bytes]",
+            &trimmed[..REDACTED_BODY_MAX_LEN],
+            trimmed.len()
+        )
     }
 }
 
@@ -389,7 +1009,11 @@ fn config_string(account: &Account, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn map_graph_message_to_email(message: &GraphMessage, account: &Account) -> Result<Email> {
+fn map_graph_message_to_email(
+    message: &GraphMessage,
+    account: &Account,
+    folder: &DiscoveredFolder,
+) -> Result<Email> {
     let id = message
         .id
         .clone()
@@ -454,7 +1078,7 @@ fn map_graph_message_to_email(message: &GraphMessage, account: &Account) -> Resu
         importance: message.importance.clone(),
         is_read: message.is_read,
         has_attachments: message.has_attachments,
-        folder: Some("inbox".to_string()),
+        folder: Some(folder.ess_label.clone()),
         categories: message.categories.clone().unwrap_or_default(),
         flag_status: message
             .flag
@@ -488,13 +1112,16 @@ fn body_fields(body: Option<&GraphBody>) -> (Option<String>, Option<String>) {
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("html"))
     {
-        let plain = html2text::from_read(content.as_bytes(), 120)
-            .lines()
-            .map(str::trim_end)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
+        let plain = std::panic::catch_unwind(|| {
+            html2text::from_read(content.as_bytes(), 120)
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
         let body_text = if plain.is_empty() { None } else { Some(plain) };
         return (body_text, Some(content.to_string()));
     }
@@ -660,7 +1287,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(raw: &str) -> Result<Vec<u8>> {
     let value = raw.trim();
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return Err(anyhow!("hex string length must be even"));
     }
 
@@ -692,6 +1319,14 @@ struct GraphDeltaPage {
     next_link: Option<String>,
     #[serde(rename = "@odata.deltaLink")]
     delta_link: Option<String>,
+}
+
+/// Response page from the plain `/messages` list endpoint (no deltaLink).
+#[derive(Debug, Clone, Deserialize)]
+struct GraphMessagesPage {
+    value: Vec<GraphMessage>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -798,51 +1433,32 @@ impl EmailConnector for GraphApiConnector {
         indexer: &mut EmailIndex,
         account: &Account,
     ) -> Result<SyncReport> {
-        let token = self.get_access_token(db, account).await?;
         let mut report = SyncReport::default();
 
         db.insert_account(account)
             .context("upsert account before graph sync")?;
 
-        let mut next_url = self
-            .load_delta_link(db, account)?
-            .unwrap_or(self.initial_delta_url(account)?);
-        let mut newest_delta_link: Option<String> = None;
+        let folders = self.discover_folders(db, account).await?;
 
-        loop {
-            let page = self.fetch_delta_page_with_retry(&token, &next_url).await?;
+        for folder in &folders {
+            eprintln!(
+                "graph sync {} starting folder={} ({})",
+                account.account_id, folder.ess_label, folder.display_name
+            );
 
-            for message in &page.value {
-                match self.apply_message(db, indexer, account, message) {
-                    Ok(ApplyResult::Added) => report.emails_added += 1,
-                    Ok(ApplyResult::Updated | ApplyResult::Deleted) => report.emails_updated += 1,
-                    Err(error) => {
-                        let message_id = message.id.as_deref().unwrap_or("<missing-id>");
-                        let removed_reason = message
-                            .removed
-                            .as_ref()
-                            .and_then(|removed| removed.reason.as_deref())
-                            .unwrap_or("-");
-                        report.errors.push(format!(
-                            "id={message_id} removed_reason={removed_reason}: {error}"
-                        ));
-                    }
+            match self.sync_folder(db, indexer, account, folder).await {
+                Ok(folder_report) => {
+                    report.emails_added += folder_report.emails_added;
+                    report.emails_updated += folder_report.emails_updated;
+                    report.errors.extend(folder_report.errors);
+                }
+                Err(error) => {
+                    report.errors.push(format!(
+                        "folder={} ({}): {}",
+                        folder.ess_label, folder.display_name, error
+                    ));
                 }
             }
-
-            if let Some(delta_link) = page.delta_link {
-                newest_delta_link = Some(delta_link);
-            }
-
-            if let Some(url) = page.next_link {
-                next_url = url;
-                continue;
-            }
-            break;
-        }
-
-        if let Some(delta_link) = newest_delta_link {
-            self.store_delta_link(db, account, &delta_link)?;
         }
 
         Ok(report)
@@ -861,22 +1477,21 @@ impl EmailConnector for GraphApiConnector {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{LazyLock, Mutex};
-
     use chrono::Duration;
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        map_graph_message_to_email, CachedAccessToken, GraphApiConnector, GraphCredentials, GraphMessage,
-        OAuthTokenResponse, TOKEN_CACHE_ENCRYPTION_KEY_ENV,
+        is_excluded_folder, legacy_delta_key_name, map_graph_message_to_email,
+        normalize_folder_label, CachedAccessToken, DiscoveredFolder, GraphApiConnector,
+        GraphCredentials, GraphMessage, OAuthTokenResponse, TOKEN_CACHE_ENCRYPTION_KEY_ENV,
     };
+    use crate::connectors::TOKEN_ENV_LOCK;
     use crate::db::models::{Account, AccountType};
     use crate::db::Database;
 
     const TEST_TOKEN_CACHE_KEY_HEX: &str =
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct TokenCacheKeyGuard;
 
@@ -895,6 +1510,14 @@ mod tests {
 
     fn temp_db_path() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("ess-graph-token-test-{}.db", Uuid::new_v4()))
+    }
+
+    fn test_folder(display_name: &str) -> DiscoveredFolder {
+        DiscoveredFolder {
+            folder_id: format!("folder-id-{}", display_name.to_lowercase().replace(' ', "-")),
+            display_name: display_name.to_string(),
+            ess_label: normalize_folder_label(display_name),
+        }
     }
 
     fn account() -> Account {
@@ -924,7 +1547,7 @@ mod tests {
 
     #[test]
     fn cached_token_round_trip_in_sync_state() {
-        let _lock = ENV_LOCK.lock().expect("lock env mutation");
+        let _lock = TOKEN_ENV_LOCK.lock().expect("lock env mutation");
         let _key_guard = TokenCacheKeyGuard::set();
 
         let connector = GraphApiConnector::new();
@@ -960,7 +1583,7 @@ mod tests {
 
     #[test]
     fn token_cache_is_not_persisted_without_encryption_key() {
-        let _lock = ENV_LOCK.lock().expect("lock env mutation");
+        let _lock = TOKEN_ENV_LOCK.lock().expect("lock env mutation");
         std::env::remove_var(TOKEN_CACHE_ENCRYPTION_KEY_ENV);
 
         let connector = GraphApiConnector::new();
@@ -1019,7 +1642,9 @@ mod tests {
 
         let message: GraphMessage =
             serde_json::from_value(payload).expect("deserialize graph message");
-        let mapped = map_graph_message_to_email(&message, &account).expect("map graph message");
+        let inbox = test_folder("Inbox");
+        let mapped =
+            map_graph_message_to_email(&message, &account, &inbox).expect("map graph message");
         assert_eq!(mapped.id, "msg-1");
         assert_eq!(mapped.from_address.as_deref(), Some("alex@example.com"));
         assert_eq!(
@@ -1035,13 +1660,179 @@ mod tests {
     }
 
     #[test]
-    fn initial_delta_url_is_account_scoped() {
+    fn initial_delta_url_is_account_and_folder_scoped() {
         let connector = GraphApiConnector::new();
         let account = account();
+        let inbox = test_folder("Inbox");
         let url = connector
-            .initial_delta_url(&account)
+            .initial_delta_url(&account, &inbox)
             .expect("build initial delta url");
-        assert!(url.contains("/users/owner@example.com/mailFolders/inbox/messages/delta"));
+        assert!(url.contains("/users/owner@example.com/mailFolders/folder-id-inbox/messages/delta"));
         assert!(url.contains("%24select="));
+
+        let sent = test_folder("Sent Items");
+        let sent_url = connector
+            .initial_delta_url(&account, &sent)
+            .expect("build sent delta url");
+        assert!(sent_url.contains("/mailFolders/folder-id-sent-items/messages/delta"));
+    }
+
+    #[test]
+    fn delta_link_key_is_folder_scoped() {
+        let account = account();
+        let key_a = GraphApiConnector::delta_link_key(&account, "folder-id-aaa");
+        let key_b = GraphApiConnector::delta_link_key(&account, "folder-id-bbb");
+        assert_eq!(key_a, "graph_delta_link:acc-pro:folder-id-aaa");
+        assert_eq!(key_b, "graph_delta_link:acc-pro:folder-id-bbb");
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn legacy_inbox_delta_link_is_migrated() {
+        let connector = GraphApiConnector::new();
+        let account = account();
+        let db_path = temp_db_path();
+        let db = Database::open(&db_path).expect("open db");
+
+        // Store a delta link under the legacy (un-scoped) key.
+        let legacy_key = GraphApiConnector::legacy_delta_link_key(&account);
+        db.set_sync_state(&legacy_key, "https://graph.microsoft.com/v1.0/delta-link-old")
+            .expect("seed legacy delta link");
+
+        let inbox = test_folder("Inbox");
+        let loaded = connector
+            .load_delta_link(&db, &account, &inbox)
+            .expect("load delta link")
+            .expect("delta link exists");
+        assert_eq!(loaded, "https://graph.microsoft.com/v1.0/delta-link-old");
+
+        // The new folder-ID-scoped key should now hold the value.
+        let new_key = GraphApiConnector::delta_link_key(&account, &inbox.folder_id);
+        let new_value = db
+            .get_sync_state(&new_key)
+            .expect("read new key")
+            .expect("new key exists")
+            .value
+            .expect("new key has value");
+        assert_eq!(new_value, "https://graph.microsoft.com/v1.0/delta-link-old");
+
+        // The legacy key should be removed.
+        assert!(db
+            .get_sync_state(&legacy_key)
+            .expect("read legacy key")
+            .is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn legacy_wellknown_delta_link_is_migrated() {
+        let connector = GraphApiConnector::new();
+        let account = account();
+        let db_path = temp_db_path();
+        let db = Database::open(&db_path).expect("open db");
+
+        // Store a delta link under the old well-known-name key format.
+        let legacy_wk_key =
+            GraphApiConnector::legacy_wellknown_delta_link_key(&account, "sentitems");
+        db.set_sync_state(
+            &legacy_wk_key,
+            "https://graph.microsoft.com/v1.0/delta-link-sent",
+        )
+        .expect("seed legacy well-known delta link");
+
+        let sent = test_folder("Sent Items");
+        let loaded = connector
+            .load_delta_link(&db, &account, &sent)
+            .expect("load delta link")
+            .expect("delta link exists");
+        assert_eq!(
+            loaded,
+            "https://graph.microsoft.com/v1.0/delta-link-sent"
+        );
+
+        // The new folder-ID key should hold the value.
+        let new_key = GraphApiConnector::delta_link_key(&account, &sent.folder_id);
+        let new_value = db
+            .get_sync_state(&new_key)
+            .expect("read new key")
+            .expect("new key exists")
+            .value
+            .expect("new key has value");
+        assert_eq!(
+            new_value,
+            "https://graph.microsoft.com/v1.0/delta-link-sent"
+        );
+
+        // The legacy well-known key should be removed.
+        assert!(db
+            .get_sync_state(&legacy_wk_key)
+            .expect("read legacy key")
+            .is_none());
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn folder_mapping_uses_normalized_label() {
+        let account = account();
+        let payload = json!({
+            "id": "msg-sent-1",
+            "subject": "Sent message",
+            "receivedDateTime": "2026-01-01T12:00:00Z"
+        });
+        let message: GraphMessage =
+            serde_json::from_value(payload).expect("deserialize graph message");
+
+        let sent_folder = test_folder("Sent Items");
+        let mapped =
+            map_graph_message_to_email(&message, &account, &sent_folder).expect("map message");
+        assert_eq!(mapped.folder.as_deref(), Some("sent"));
+
+        let trash_folder = test_folder("Deleted Items");
+        let mapped_trash =
+            map_graph_message_to_email(&message, &account, &trash_folder).expect("map message");
+        assert_eq!(mapped_trash.folder.as_deref(), Some("trash"));
+    }
+
+    #[test]
+    fn normalize_folder_label_maps_well_known_names() {
+        assert_eq!(normalize_folder_label("Inbox"), "inbox");
+        assert_eq!(normalize_folder_label("Sent Items"), "sent");
+        assert_eq!(normalize_folder_label("Archive"), "archive");
+        assert_eq!(normalize_folder_label("Drafts"), "drafts");
+        assert_eq!(normalize_folder_label("Deleted Items"), "trash");
+        assert_eq!(normalize_folder_label("Junk Email"), "spam");
+        assert_eq!(normalize_folder_label("Outbox"), "outbox");
+        assert_eq!(normalize_folder_label("Conversation History"), "conversation_history");
+        // Custom folders pass through as lowercase
+        assert_eq!(normalize_folder_label("My Custom Folder"), "my custom folder");
+        assert_eq!(normalize_folder_label("Blocked"), "blocked");
+        assert_eq!(normalize_folder_label("Later"), "later");
+    }
+
+    #[test]
+    fn excluded_folders_are_filtered() {
+        assert!(is_excluded_folder("Sync Issues"));
+        assert!(is_excluded_folder("sync issues"));
+        assert!(is_excluded_folder("SYNC ISSUES"));
+        assert!(is_excluded_folder("Conflicts"));
+        assert!(is_excluded_folder("Local Failures"));
+        assert!(is_excluded_folder("Server Failures"));
+        assert!(!is_excluded_folder("Inbox"));
+        assert!(!is_excluded_folder("Archive"));
+        assert!(!is_excluded_folder("Custom Folder"));
+    }
+
+    #[test]
+    fn legacy_delta_key_name_maps_well_known_folders() {
+        assert_eq!(legacy_delta_key_name("Inbox"), Some("inbox"));
+        assert_eq!(legacy_delta_key_name("Sent Items"), Some("sentitems"));
+        assert_eq!(legacy_delta_key_name("Archive"), Some("archive"));
+        assert_eq!(legacy_delta_key_name("Drafts"), Some("drafts"));
+        assert_eq!(legacy_delta_key_name("Deleted Items"), Some("deleteditems"));
+        assert_eq!(legacy_delta_key_name("Junk Email"), Some("junkemail"));
+        assert_eq!(legacy_delta_key_name("Custom Folder"), None);
+        assert_eq!(legacy_delta_key_name("Outbox"), None);
     }
 }

@@ -8,9 +8,11 @@ use crate::db::models::Account;
 use crate::db::Database;
 use crate::indexer::EmailIndex;
 
+pub mod gmail_api;
 pub mod graph_api;
 pub mod json_archive;
 
+pub use gmail_api::GmailApiConnector;
 pub use graph_api::GraphApiConnector;
 pub use json_archive::JsonArchiveConnector;
 
@@ -80,6 +82,13 @@ impl Default for ConnectorRegistry {
         Self::new()
     }
 }
+
+/// Shared mutex for tests that mutate environment variables (token cache key).
+/// Both `graph_api::tests` and `gmail_api::tests` must acquire this before
+/// touching `ESS_TOKEN_CACHE_KEY` to avoid poisoning each other's state.
+#[cfg(test)]
+pub(crate) static TOKEN_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
 #[cfg(test)]
 mod tests {
